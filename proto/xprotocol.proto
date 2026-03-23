@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package xprotocol.v1;
+
+message ServiceRequest {
+  string request_id = 1;
+  string correlation_id = 2;
+  string service_name = 3;
+  string method = 4;
+  string payload = 5;
+}
+
+message ServiceResponse {
+  string request_id = 1;
+  string correlation_id = 2;
+  string status = 3;
+  string payload = 4;
+  optional string error = 5;
+}
+
+service Service {
+  rpc Call(ServiceRequest) returns (ServiceResponse);
+}
