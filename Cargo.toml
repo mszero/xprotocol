@@ -7,9 +7,10 @@ description = "Distributed Service protocolunication Framework - Built on pingor
 license = "MIT"
 
 [features]
-default = ["json", "msgpack"]
+default = ["json", "msgpack", "grpc_tls"]
 json = []
 msgpack = ["rmp", "rmp-serde"]
+grpc_tls = ["tonic/tls"]
 
 [build-dependencies]
 prost-build = "0.12"

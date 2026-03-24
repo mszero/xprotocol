@@ -2,22 +2,63 @@ syntax = "proto3";
 
 package xprotocol.v1;
 
+option go_package = "github.com/xprotocol/gen/go/v1";
+option java_package = "com.xprotocol.v1";
+option java_multiple_files = true;
+
+message Metadata {
+  map<string, string> headers = 1;
+}
+
 message ServiceRequest {
   string request_id = 1;
   string correlation_id = 2;
   string service_name = 3;
   string method = 4;
-  string payload = 5;
+  bytes payload = 5;
+  optional string topic = 6;
+  optional Metadata metadata = 7;
+  int64 timestamp = 8;
 }
 
 message ServiceResponse {
   string request_id = 1;
   string correlation_id = 2;
   string status = 3;
-  string payload = 4;
+  bytes payload = 4;
   optional string error = 5;
+  optional string error_code = 6;
+  int64 timestamp = 7;
+}
+
+message StreamChunk {
+  string request_id = 1;
+  uint32 chunk_index = 2;
+  bytes payload = 3;
+  bool is_final = 4;
+}
+
+message StreamRequest {
+  ServiceRequest initial_request = 1;
+  StreamMode mode = 2;
+}
+
+enum StreamMode {
+  STREAM_MODE_UNSPECIFIED = 0;
+  STREAM_MODE_MESSAGES = 1;
+  STREAM_MODE_VALUES = 2;
+  STREAM_MODE_UPDATES = 3;
+}
+
+message StreamResponse {
+  oneof message {
+    StreamChunk chunk = 1;
+    ServiceResponse final_response = 2;
+  }
 }
 
 service Service {
   rpc Call(ServiceRequest) returns (ServiceResponse);
+  rpc CallStream(stream ServiceRequest) returns (stream ServiceResponse);
+  rpc CallServerStream(ServiceRequest) returns (stream ServiceResponse);
 }
