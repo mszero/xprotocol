@@ -2271,6 +2271,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-rustls",
+ "tokio-stream",
  "tokio-test",
  "toml",
  "tonic",

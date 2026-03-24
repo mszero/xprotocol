@@ -2,7 +2,25 @@ use crate::error::{ProtocolError, Result};
 use crate::handler::ServiceHandler;
 use crate::protocol::{ServiceRequest, ServiceResponse};
 use std::sync::Arc;
-use std::time::Duration;
+use tonic::Request;
+use xprotocol::v1::{
+    ServiceRequest as GrpcServiceRequest, ServiceResponse as GrpcServiceResponse,
+    service_server::{Service, ServiceServer},
+};
+
+mod xprotocol {
+    pub mod v1 {
+        include!("xprotocol.v1.rs");
+    }
+}
+
+const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+const HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 10;
+const HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
+const TCP_KEEPALIVE_SECS: u64 = 60;
+const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 1024 * 1024;
+const INITIAL_STREAM_WINDOW_SIZE: u32 = 512 * 1024;
+const MAX_CONCURRENT_STREAMS: u32 = 200;
 
 pub struct GrpcService<H: ServiceHandler> {
     handler: Arc<H>,
@@ -21,6 +39,8 @@ impl<H: ServiceHandler> GrpcService<H> {
             .parse::<std::net::SocketAddr>()
             .map_err(|e: std::net::AddrParseError| ProtocolError::InvalidMessage(e.to_string()))?;
 
+        let service = GrpcServiceWrapper::new(self.handler);
+
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
@@ -30,10 +50,29 @@ impl<H: ServiceHandler> GrpcService<H> {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    let handler = self.handler.clone();
+                    let service = service.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, handler).await {
-                            tracing::error!("gRPC connection error: {}", e);
+                        let service = ServiceServer::new(service)
+                            .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                            .max_encoding_message_size(MAX_MESSAGE_SIZE);
+                        if let Err(e) = tonic::transport::Server::builder()
+                            .initial_connection_window_size(INITIAL_CONNECTION_WINDOW_SIZE)
+                            .initial_stream_window_size(INITIAL_STREAM_WINDOW_SIZE)
+                            .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+                            .http2_keepalive_interval(Some(std::time::Duration::from_secs(
+                                HTTP2_KEEPALIVE_INTERVAL_SECS,
+                            )))
+                            .http2_keepalive_timeout(Some(std::time::Duration::from_secs(
+                                HTTP2_KEEPALIVE_TIMEOUT_SECS,
+                            )))
+                            .tcp_keepalive(Some(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS)))
+                            .add_service(service)
+                            .serve_with_incoming(futures::stream::iter([Ok::<_, std::io::Error>(
+                                stream,
+                            )]))
+                            .await
+                        {
+                            tracing::error!("gRPC serve error: {}", e);
                         }
                     });
                 }
@@ -45,105 +84,117 @@ impl<H: ServiceHandler> GrpcService<H> {
     }
 }
 
-async fn handle_connection<H: ServiceHandler>(
-    stream: tokio::net::TcpStream,
+struct GrpcServiceWrapper<H: ServiceHandler> {
     handler: Arc<H>,
-) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+}
 
-    let mut stream = stream;
-    let mut buf = [0u8; 4096];
-
-    loop {
-        let result = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buf)).await;
-
-        let n = match result {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(ProtocolError::ConnectionFailed(e.to_string())),
-            Err(_) => return Err(ProtocolError::Timeout),
-        };
-
-        if n == 0 {
-            break;
-        }
-
-        let data = &buf[..n];
-
-        if data.len() > 5 {
-            let _payload_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            let _compression = data[4];
-            let payload = &data[5..];
-
-            if let Ok(request) = serde_json::from_slice::<ServiceRequest>(payload) {
-                let response = handler.handle(request).await;
-
-                let response_data = serde_json::to_vec(&response)
-                    .map_err(|e| ProtocolError::Encoding(e.to_string()))?;
-
-                let mut response_frame = vec![0u8; 5];
-                response_frame[0..4].copy_from_slice(&(response_data.len() as u32).to_be_bytes());
-                response_frame[4] = 0;
-                response_frame.extend(response_data);
-
-                stream
-                    .write_all(&response_frame)
-                    .await
-                    .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
-            }
+impl<H: ServiceHandler> Clone for GrpcServiceWrapper<H> {
+    fn clone(&self) -> Self {
+        Self {
+            handler: self.handler.clone(),
         }
     }
+}
 
-    Ok(())
+impl<H: ServiceHandler> GrpcServiceWrapper<H> {
+    fn new(handler: Arc<H>) -> Self {
+        Self { handler }
+    }
+}
+
+#[tonic::async_trait]
+impl<H: ServiceHandler + 'static> Service for GrpcServiceWrapper<H> {
+    async fn call(
+        &self,
+        request: Request<GrpcServiceRequest>,
+    ) -> std::result::Result<tonic::Response<GrpcServiceResponse>, tonic::Status> {
+        let req = request.into_inner();
+
+        let payload: serde_json::Value = serde_json::from_str(&req.payload)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid payload: {}", e)))?;
+
+        let internal_request = ServiceRequest {
+            request_id: req.request_id,
+            correlation_id: req.correlation_id,
+            service_name: req.service_name,
+            method: req.method,
+            payload,
+            topic: None,
+        };
+
+        let response = self.handler.handle(internal_request).await;
+
+        let payload_str = serde_json::to_string(&response.payload)
+            .map_err(|e| tonic::Status::internal(format!("serialization error: {}", e)))?;
+
+        let grpc_response = GrpcServiceResponse {
+            request_id: response.request_id,
+            correlation_id: response.correlation_id,
+            status: response.status,
+            payload: payload_str,
+            error: response.error,
+        };
+
+        Ok(tonic::Response::new(grpc_response))
+    }
 }
 
 pub struct GrpcClient {
-    addr: String,
+    client: xprotocol::v1::service_client::ServiceClient<tonic::transport::Channel>,
 }
 
 impl GrpcClient {
-    pub fn new(addr: &str) -> Self {
-        Self {
-            addr: addr.to_string(),
-        }
+    pub async fn connect(addr: &str) -> Result<Self> {
+        let endpoint = format!("http://{}", addr);
+        let endpoint = tonic::transport::Endpoint::new(endpoint)?
+            .clone()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS)))
+            .http2_adaptive_window(true)
+            .initial_connection_window_size(INITIAL_CONNECTION_WINDOW_SIZE)
+            .initial_stream_window_size(INITIAL_STREAM_WINDOW_SIZE);
+
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
+
+        let client = xprotocol::v1::service_client::ServiceClient::new(channel)
+            .max_decoding_message_size(MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_MESSAGE_SIZE);
+
+        Ok(Self { client })
     }
 
     pub async fn call(&mut self, request: ServiceRequest) -> Result<ServiceResponse> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let payload_str = serde_json::to_string(&request.payload)
+            .map_err(|e| ProtocolError::Encoding(e.to_string()))?;
 
-        let mut stream = tokio::net::TcpStream::connect(&self.addr)
+        let grpc_request = GrpcServiceRequest {
+            request_id: request.request_id,
+            correlation_id: request.correlation_id,
+            service_name: request.service_name,
+            method: request.method,
+            payload: payload_str,
+        };
+
+        let response = self
+            .client
+            .call(Request::new(grpc_request))
             .await
             .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
 
-        let request_data =
-            serde_json::to_vec(&request).map_err(|e| ProtocolError::Encoding(e.to_string()))?;
+        let resp = response.into_inner();
 
-        let mut frame = vec![0u8; 5];
-        frame[0..4].copy_from_slice(&(request_data.len() as u32).to_be_bytes());
-        frame[4] = 0;
-        frame.extend(request_data);
+        let payload: serde_json::Value = serde_json::from_str(&resp.payload)
+            .map_err(|e| ProtocolError::Encoding(e.to_string()))?;
 
-        stream
-            .write_all(&frame)
-            .await
-            .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
-
-        let mut header = [0u8; 5];
-        stream
-            .read_exact(&mut header)
-            .await
-            .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
-
-        let payload_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-
-        let mut payload = vec![0u8; payload_len];
-        stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
-
-        let response: ServiceResponse =
-            serde_json::from_slice(&payload).map_err(|e| ProtocolError::Encoding(e.to_string()))?;
-
-        Ok(response)
+        Ok(ServiceResponse {
+            request_id: resp.request_id,
+            correlation_id: resp.correlation_id,
+            status: resp.status,
+            payload,
+            error: resp.error,
+        })
     }
 }

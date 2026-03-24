@@ -34,6 +34,12 @@ impl From<serde_json::Error> for ProtocolError {
     }
 }
 
+impl From<tonic::transport::Error> for ProtocolError {
+    fn from(e: tonic::transport::Error) -> Self {
+        ProtocolError::ConnectionFailed(e.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 
 #[allow(non_upper_case_globals)]
